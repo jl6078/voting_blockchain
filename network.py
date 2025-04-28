@@ -31,15 +31,11 @@ class Node:
 
     def add_neighbor(self, neighbor_id, cost=None):
         """
-        Add a neighbor ID to this node’s neighbor list (cost unused).
-
-        Parameters:
-            neighbor_id : str
-                The peer’s ID.
-            cost : any
-                Ignored; kept for backward compatibility.
+        Add a neighbor ID to this node’s neighbor list (ignores self &
+        avoids duplicates). `cost` is unused and kept for signature
+        compatibility.
         """
-        if neighbor_id not in self.neighbors:
+        if neighbor_id != self.node_id and neighbor_id not in self.neighbors:
             self.neighbors.append(neighbor_id)
 
     def __repr__(self):
@@ -69,7 +65,10 @@ class Tracker:
     def _refresh_neighbor_lists(self):
         ids = list(self.peers.keys())
         for nid, peer in self.peers.items():
-            peer.neighbors = [other for other in ids if other != nid]
+            peer.neighbors = [other for other in ids
+                              if other != nid and other not in peer.neighbors]
+            # de‑duplicate in case topology + refresh overlap
+            peer.neighbors = list(dict.fromkeys(peer.neighbors))
 
     def _broadcast_peer_list(self):
         self._refresh_neighbor_lists()

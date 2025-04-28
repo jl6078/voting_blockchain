@@ -114,8 +114,8 @@ class Blockchain:
         self.chain = []
         self.difficulty = difficulty
         
-        # Thread-safe access to the chain
-        self.lock = threading.Lock()
+        # Thread‑safe access to the chain (allow re‑entrant acquisition)
+        self.lock = threading.RLock()
         
         # Pending transactions
         self.pending_transactions = []
