@@ -2,6 +2,8 @@ import sys
 import socket
 import time
 
+import threading
+
 class NetworkInterface():
     """
     DO NOT EDIT.
@@ -24,7 +26,7 @@ class NetworkInterface():
         self.sock.connect((network_ip, network_port))
         self.init_msg = self.sock.recv(4096).decode() # receive the initial message from the network
         
-    def initial_costs(self): 
+    def initial_message(self): 
         """
         Return the initial message received from the network in following format:
         <node_id>. <neighbor_1>:<cost_1>,...,<neighbor_n>:<cost_n>
@@ -64,125 +66,77 @@ class NetworkInterface():
         """
         return self.sock.recv(length)
     
+    def listen_for_messages(self):
+        while True:
+            try:
+                data = self.recv(4096)
+                if data:
+                    print(f"\n[Received] {data.decode()}\n> ", end="", flush=True)
+            except Exception as e:
+                print(f"Error receiving data: {e}")
+                break
+
     def close(self):
         """
         Close the socket connection with the network.
         """
         self.sock.close()
 
-def get_distance_vector(dv_table):
-    """
-    Get distance vector from the dv_table.
-    """
-    dest_to_neighbors = {}
-    for neighbor_id, dest_tuples_list in dv_table.items():
-        for dest_id, cost in dest_tuples_list:
-            dest_to_neighbors.setdefault(dest_id, []).append((neighbor_id, cost))
-    
-    distance_vector = {
-        dest: min(neighbor_pairs, key=lambda x: x[1])[1]
-        for dest, neighbor_pairs in dest_to_neighbors.items()
-    }
-        
-    return distance_vector
 
 def parse_message(message):
     """
-    Parse the message to extract node_id and distance vector.
+    Parse the message to extract a Block object from a string representation of that object
     """
-    node_id = message.split(".")[0] 
-    neighbors_pairs = message.split(". ")[1].split(",") 
-    dv = {}
-
-    for pair in neighbors_pairs:
-        dest_id, cost = pair.split(":")
-        if dest_id in dv:
-            print("Duplicate destination id found in message")
-        dv[dest_id] = int(cost) 
-
-    return node_id, dv
-
-
-def update_dv(local_node_id, recv_node_id, local_dv_table, recv_dv, direct_link_costs):
-    """
-    Update the distance vector table with the new distance vector.
-    Returns updated DV table and DV
-    """
+    return
     
-    recv_dests = recv_dv.keys()
-    recv_neighbor = recv_node_id
+def block_to_message(block):
+    return
 
-
-
-    new_dv = {}
-    dests_list = []
-    """Only need to update local_dv_table values for the (neighbor, neighbor_dest) pairs in recv_dv"""
-    for recv_dest in recv_dests:
-        """Don't add destination if it's the local node"""
-        if recv_dest != local_node_id:
-            new_cost = direct_link_costs[recv_neighbor] + recv_dv[recv_dest]
-            dests_list.append((recv_dest, new_cost))
+# def write_log(node_id, dv_table):
+#     """
+#     Write the distance vector table to a log file.
+#     """
+#     log_file = open(f"log_{node_id}.txt", "a") 
+#     dest_to_neighbors = {}
+#     for neighbor_id, dest_tuples_list in dv_table.items():
+#         for dest_id, cost in dest_tuples_list:
+#             dest_to_neighbors.setdefault(dest_id, []).append((neighbor_id, cost))
     
-    new_dest_ids = [dest[0] for dest in dests_list]
-    original_dest_pairs = local_dv_table[recv_neighbor]
+#     distance_vector = {
+#         dest: min(neighbor_pairs, key=lambda x: x[1])
+#         for dest, neighbor_pairs in dest_to_neighbors.items()
+#     }
 
-    """Make sure we don't eliminate destinations which aren't featured in recv_dv"""
-    for pair in original_dest_pairs:
-        if pair[0] not in new_dest_ids:
-            dests_list.append(pair)
-            new_dest_ids.append(pair[0])
+#     log_string = ""
+#     for dest_id, neighbor_pair in distance_vector.items():
+#         neighbor = neighbor_pair[0]
+#         cost = neighbor_pair[1]
+#         log_string += f"{dest_id}:{cost}:{neighbor} "
 
-    """Add new values"""
-    new_local_dv_table = local_dv_table.copy()
-    new_local_dv_table[recv_neighbor] = dests_list 
-    new_dv = get_distance_vector(new_local_dv_table)
+#     log_string+= "\n"
+#     log_file.write(log_string)
+#     log_file.flush() # IMPORTANT
 
-    return new_local_dv_table, new_dv
+def send_user_blocks():
+    while True:
+        try:
+            votesA = input("> Enter votes for party A:")
+            votesB = input("> Enter votes for party B:")
 
-def dv_to_message(node_id, dv):
-    """
-    Send the distance vector to neighbors.
-    """
-    message = f"{node_id}. "
-    for dest_id, cost in dv.items():
-        message += f"{dest_id}:{cost},"
+            voteTransaction = {"votesA": votesA, "votesB": votesB}
 
-    message = message[:-1] # remove the last comma
-    message += "\n"
-    return message.encode()
+            # Initialize new block (including mining)
+            # Add depth of each block
 
-def write_log(node_id, dv_table):
-    """
-    Write the distance vector table to a log file.
-    """
-    log_file = open(f"log_{node_id}.txt", "a") 
-    dest_to_neighbors = {}
-    for neighbor_id, dest_tuples_list in dv_table.items():
-        for dest_id, cost in dest_tuples_list:
-            dest_to_neighbors.setdefault(dest_id, []).append((neighbor_id, cost))
-    
-    distance_vector = {
-        dest: min(neighbor_pairs, key=lambda x: x[1])
-        for dest, neighbor_pairs in dest_to_neighbors.items()
-    }
+            if block:
 
-    log_string = ""
-    for dest_id, neighbor_pair in distance_vector.items():
-        neighbor = neighbor_pair[0]
-        cost = neighbor_pair[1]
-        log_string += f"{dest_id}:{cost}:{neighbor} "
-
-    log_string+= "\n"
-    log_file.write(log_string)
-    log_file.flush() # IMPORTANT
-
-
-
-
-
-
+                sock.sendall(block.encode())
+        except Exception as e:
+            print(f"Error sending data: {e}")
+            break
 
     
+
 
 if __name__ == '__main__':
     network_ip = sys.argv[1] # the IP address of the network
@@ -190,32 +144,51 @@ if __name__ == '__main__':
  
     net_interface = NetworkInterface(network_port, network_ip) # initialize the network interface
 
-    init_costs = net_interface.initial_costs() 
-    print(init_costs)
+    # init_costs = net_interface.initial_costs() 
+    init_message = net_interface.initial_message() 
+    # print(init_costs)
 
     """Below is an example of how to use the network interface and log. Replace it with your distance vector routing protocol"""
 
-    neighbors = []
+    # neighbors = []
 
-    direct_link_costs = {}
+    """Initialize node_id and neighbors"""
+    # dv_table = {} 
+    node_id = init_message.split(".")[0] 
+    neighbors = init_message.split(". ")[1].split(",") 
 
-    """Initialize DV table and DV"""
-    dv_table = {} 
-    node_id = init_costs.split(".")[0] 
-    neighbors_pairs = init_costs.split(". ")[1].split(",") 
 
-    """Initialize dv table with the costs of direct neighbors"""
-    for pair in neighbors_pairs:
-        neighbor_id, cost = pair.split(":") 
-        if neighbor_id not in neighbors:
-            neighbors.append(neighbor_id)
-            direct_link_costs[neighbor_id] = int(cost) 
+    # Start the listener thread
+    listener_thread = threading.Thread(target=net_interface.listen_for_messages, daemon=True)
+    listener_thread.start()
 
-        dv_table.setdefault(neighbor_id, []).append((neighbor_id, int(cost)))
 
-    """Log initial distance vector"""
-    log_file = open(f"log_{node_id}.txt", "w") 
-    write_log(node_id, dv_table)
+
+
+    # Main thread handles user input
+    send_user_blocks()
+
+
+
+
+
+
+
+
+
+
+    # """Initialize dv table with the costs of direct neighbors"""
+    # for pair in neighbors_pairs:
+    #     neighbor_id, cost = pair.split(":") 
+    #     if neighbor_id not in neighbors:
+    #         neighbors.append(neighbor_id)
+    #         direct_link_costs[neighbor_id] = int(cost) 
+
+    #     dv_table.setdefault(neighbor_id, []).append((neighbor_id, int(cost)))
+
+    # """Log initial distance vector"""
+    # log_file = open(f"log_{node_id}.txt", "w") 
+    # write_log(node_id, dv_table)
     
     """Extract DV from DV table"""
     distance_vector = get_distance_vector(dv_table) 
