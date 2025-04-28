@@ -2,6 +2,9 @@ import socket
 import threading
 import sys
 import time
+import json
+
+# ───────────────────────── Tracker globals & helpers ─────────────────────────
 
 LOG_LEVEL  = "INFO"
 
@@ -23,24 +26,136 @@ class Node:
         self.port = None
         self.connection = None
         self.connection_lock = None
-        self.neighbors = dict()  # key: neighbor_id, value: cost
+        self.node_id = None     # assigned after REGISTER
+        self.neighbors: list[str] = []   # list of current peer IDs (no costs)
 
-    def add_neighbor(self, neighbor_id, cost):
+    def add_neighbor(self, neighbor_id, cost=None):
         """
-        Add a neighbor and its associated cost to the node's list of neighbors, 
-        if it doesn't already exist.
+        Add a neighbor ID to this node’s neighbor list (cost unused).
 
         Parameters:
             neighbor_id : str
-                Unique identifier for the neighbor node.
-            cost : int
-                Cost to reach the neighbor node.
+                The peer’s ID.
+            cost : any
+                Ignored; kept for backward compatibility.
         """
         if neighbor_id not in self.neighbors:
-            self.neighbors[neighbor_id] = cost
+            self.neighbors.append(neighbor_id)
 
     def __repr__(self):
         return f"Node {self.node_id}. Neighbors: {self.neighbors}. Port: {self.port}."
+
+# ────────────────────────────── Tracker class ──────────────────────────────
+class Tracker:
+    """
+    Single‑instance tracker that maintains the live roster of peers and
+    broadcasts updates. It wraps all previous global state in one place.
+    """
+    def __init__(self, port: int, difficulty: int = 3, genesis_hash: str | None = None):
+        self.port           = port
+        self.difficulty     = difficulty
+        self.genesis_hash   = genesis_hash or ("0" * 64)
+        self.peers: dict[str, Node] = {}          # node_id ➜ Node
+        self.lock = threading.Lock()              # protects self.peers
+        self.server_socket: socket.socket | None = None
+
+    # ── helper -------------------------------------------------------------
+    @staticmethod
+    def send_msg(sock: socket.socket, msg: dict) -> None:
+        raw = json.dumps(msg, separators=(",", ":")).encode()
+        sock.sendall(len(raw).to_bytes(4, "big") + raw)
+
+    # ── roster maintenance -------------------------------------------------
+    def _refresh_neighbor_lists(self):
+        ids = list(self.peers.keys())
+        for nid, peer in self.peers.items():
+            peer.neighbors = [other for other in ids if other != nid]
+
+    def _broadcast_peer_list(self):
+        self._refresh_neighbor_lists()
+        roster_msg = {
+            "type": "PEER_LIST",
+            "src":  "tracker",
+            "dst":  "*",
+            "ts":   time.time(),
+            "payload": { "nodes": list(self.peers.keys()) }
+        }
+        for peer in self.peers.values():
+            self.send_msg(peer.connection, roster_msg)
+
+    # ── message forwarding -------------------------------------------------
+    def _forward(self, msg: dict, sender: str) -> None:
+        dst = msg.get("dst", "*")
+        if dst in ("*", "broadcast"):
+            for nid, peer in self.peers.items():
+                if nid != sender:
+                    self.send_msg(peer.connection, msg)
+        elif dst in self.peers:
+            self.send_msg(self.peers[dst].connection, msg)
+
+    def _drop_peer(self, node: Node):
+        """Remove peer on disconnect and broadcast new roster."""
+        with self.lock:
+            if node.node_id and node.node_id in self.peers:
+                del self.peers[node.node_id]
+        self._broadcast_peer_list()
+
+    # ── per‑connection thread --------------------------------------------
+    def _node_thread(self, node: Node):
+        while True:
+            try:
+                hdr = node.connection.recv(4)
+                if not hdr:
+                    break
+                data = node.connection.recv(int.from_bytes(hdr, "big"))
+                if not data:
+                    break
+                msg = json.loads(data)
+            except (ConnectionResetError, json.JSONDecodeError):
+                break
+
+            # first packet must be REGISTER
+            if node.node_id is None:
+                if msg.get("type") != "REGISTER":
+                    break
+                nid = msg["payload"]["node_id"]
+                with self.lock:
+                    if nid in self.peers:
+                        break  # duplicate ID
+                    node.node_id = nid
+                    self.peers[nid] = node
+                self._broadcast_peer_list()
+                continue
+
+            # graceful leave
+            if msg.get("type") == "LEAVE":
+                self._drop_peer(node)
+                return
+
+            # all other traffic
+            self._forward(msg, sender=node.node_id)
+
+        self._drop_peer(node)
+
+    # ── main accept loop ---------------------------------------------------
+    def serve_forever(self):
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind(('', self.port))
+        self.server_socket.listen()
+        print(f"[tracker] Listening on 0.0.0.0:{self.port}")
+
+        try:
+            while True:
+                conn, addr = self.server_socket.accept()
+                node = Node("temp")
+                node.connection = conn
+                node.connection_lock = threading.Lock()
+                threading.Thread(target=self._node_thread,
+                                 args=(node,),
+                                 daemon=True).start()
+        finally:
+            self.server_socket.close()
 
 def check_topology_format(filename):
     """
@@ -93,16 +208,16 @@ def parse_topology(filename):
                 cost = line.split()[2]
                 if node_id_a not in nodes:
                     new_node = Node(node_id_a)
-                    new_node.add_neighbor(node_id_b, cost)
+                    new_node.add_neighbor(node_id_b)
                     nodes[node_id_a] = new_node
                 else:
-                    nodes[node_id_a].add_neighbor(node_id_b, cost)
+                    nodes[node_id_a].add_neighbor(node_id_b)
                 if node_id_b not in nodes:
                     new_node = Node(node_id_b)
-                    new_node.add_neighbor(node_id_a, cost)
+                    new_node.add_neighbor(node_id_a)
                     nodes[node_id_b] = new_node
                 else:
-                    nodes[node_id_b].add_neighbor(node_id_a, cost)
+                    nodes[node_id_b].add_neighbor(node_id_a)
     return nodes
 
 
@@ -121,95 +236,16 @@ def network_log(message, level = "INFO"):
     elif level == "INFO" and LOG_LEVEL in ["INFO", "DEBUG"]:
         print(f"[network] {message}")
 
-def node_thread(node):
-    """
-    Receive and respond to messages from/to nodes in the network.
-
-    Parameters:
-        node : Node
-            The Node object representing this thread's node.
-    """
-    # send message to node with its immediate neighbors and their hop costs
-    welcome_message = f"{node.node_id}. "
-    for n, c in node.neighbors.items():
-        welcome_message += f"{n}:{c},"
-    welcome_message = welcome_message[:-1]  # remove the last comma
-    node.connection.sendall(welcome_message.encode()) 
-    
-    while True:
-        try:
-            # catch issue of connection being reset by peer, which can happen
-            # if students call close in dvr.py before the network sends data to it below
-            # also return if the node connection is gracefully closed
-            header = node.connection.recv(4)
-            if not header :
-                network_log(f"Node {node.node_id} closed socket")
-                return
-            data_len = int.from_bytes(header , byteorder='big')
-            data = node.connection.recv(data_len)
-            if not data:
-                network_log(f"Node {node.node_id} closed socket")
-                return
-        except ConnectionResetError:
-            network_log(f"Connection reset by peer for node {node.node_id}. Likely means dvr.py closed the socket or crashed.")
-            return 
-           
-        if data:
-            network_log(f"Received data from node {node.node_id}", level  = "DEBUG")
-            # for each neighbor, obtain lock and send the message
-            for neighbor_id, _ in node.neighbors.items():
-                # get the Node obj for the neighbor and send the message using the lock
-                neighbor_node = nodes[neighbor_id]
-                with neighbor_node.connection_lock:
-                    network_log(f"Sending data to neighbor {neighbor_id}", level = "DEBUG")
-                    neighbor_node.connection.sendall(data)
-          
-        time.sleep(0.1)
-
 if __name__ == '__main__':
-    NETWORK_PORT = sys.argv[1]
-    try:
-        NETWORK_PORT = int(NETWORK_PORT)
-        assert 1024 <= NETWORK_PORT <= 65535
-    except (ValueError, AssertionError):
-        print(f"Invalid network port: {NETWORK_PORT}. Must be between 1024 and 65535.")
+    if len(sys.argv) != 2:
+        print("Usage: python3 network.py <PORT>")
         sys.exit(1)
-    NETWORK_PORT = NETWORK_PORT
 
-    topology_filename = sys.argv[2]
+    try:
+        PORT = int(sys.argv[1])
+        assert 1024 <= PORT <= 65535
+    except (ValueError, AssertionError):
+        print("Port must be an int between 1024 and 65535")
+        sys.exit(1)
 
-    check_topology_format(topology_filename)
-    nodes = parse_topology(topology_filename)
-    num_nodes = len(nodes)
-
-    # create listening socket
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.bind(('', NETWORK_PORT))
-    server_socket.listen(num_nodes)
-    network_log(f"Listening on port {NETWORK_PORT} for {num_nodes} nodes...")
-
-    # wait for incoming connections from nodes until all nodes are connected
-    conn_num = 0
-    node_threads = []
-    while conn_num < num_nodes:
-        conn, addr = server_socket.accept()
-        port = addr[1]
-        node_key = list(nodes.keys())[conn_num]
-        nodes[node_key].connection = conn
-        nodes[node_key].port = port
-        conn_num += 1
-        network_log(f"Connected to {addr}")
-
-        # create thread for each node. Note: won't start until all prepped with their locks
-        nodes[node_key].connection_lock = threading.Lock()
-        t = threading.Thread(target=node_thread, args=(nodes[node_key],))
-        node_threads.append(t)
-    
-    # start all threads
-    for t in node_threads:
-        t.start()
-    
-    network_log(f"All {num_nodes} nodes connected.")
-    
-    for t in node_threads:
-        t.join()
+    Tracker(PORT).serve_forever()
