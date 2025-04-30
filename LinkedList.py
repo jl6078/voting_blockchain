@@ -54,6 +54,17 @@ class Block:
         }, sort_keys=True).encode()
         
         return hashlib.sha256(block_string).hexdigest()
+    
+        # ───────────────── header helper ─────────────────
+    def header(self) -> dict:
+        """Return a lightweight header dict (no transactions)."""
+        return {
+            "index": self.index,
+            "previous_hash": self.previous_hash,
+            "timestamp": self.timestamp,
+            "nonce": self.nonce,
+            "hash": self.hash
+        }
         
     def mine_block(self, difficulty: int) -> None:
         """

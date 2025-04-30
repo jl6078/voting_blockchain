@@ -4,6 +4,54 @@ from LinkedList import Blockchain, Block
 # Local blockchain instance and live peer list
 blockchain = Blockchain(difficulty=1)
 peer_ids: list[str] = []
+# Blocks mined locally but not yet broadcast
+pending_broadcast: list[Block] = []
+
+# ────────────────────────────── Chain reorg helper ──────────────────────────────
+def reorganize_chain(new_blk: Block):
+    """
+    Reorganize local chain so that `new_blk` can be appended.
+    Any local blocks beyond the fork point are moved to pending_broadcast.
+    Returns True if reorg done, False if no common ancestor.
+    """
+    # --- DEBUG: before any changes ---
+    with blockchain.lock:
+        # 1️⃣ find common ancestor (fork point)
+        fork_idx = None
+        for i in range(len(blockchain.chain) - 1, -1, -1):
+            if blockchain.chain[i].hash == new_blk.previous_hash:
+                fork_idx = i
+                break
+        if fork_idx is None:
+            fork_idx = 0
+
+        # 2️⃣ detach local tail (blocks after fork point) in-place so other references see the change
+        local_tail = blockchain.chain[fork_idx + 1:]
+        del blockchain.chain[fork_idx + 1:]
+
+        # 3️⃣ insert the incoming block
+        blockchain.chain.append(new_blk)
+
+        # 4️⃣ re-mine and append each saved local block so it now links to the updated tip
+        reattached = 0
+        for old_blk in local_tail:
+            # assign new sequential index to avoid duplicates
+            old_blk.index = blockchain.get_latest_block().index + 1
+            old_blk.previous_hash = blockchain.get_latest_block().hash
+            old_blk.nonce = 0
+            old_blk.hash = old_blk.calculate_hash()
+            try:
+                old_blk.mine_block(blockchain.difficulty)
+                blockchain.chain.append(old_blk)
+                reattached += 1
+            except TimeoutError:
+                print(f"[WARN] re‑mining block (old idx {old_blk.index}) timed out; queued")
+                pending_broadcast.append(old_blk)
+
+        print(f"[INFO] Reorg complete: attached broadcast block and re‑added {reattached} local blocks")
+        print("[DEBUG] Chain FINAL after re-attach:")
+        show_chain()
+        return True
 
 class NetworkInterface():
     """
@@ -102,15 +150,106 @@ class NetworkInterface():
                         blk = dict_to_block(msg["block"])
                         if blk.is_valid(blockchain.difficulty):
                             with blockchain.lock:
-                                if blk.index == blockchain.get_latest_block().index + 1:
+                                expected = blockchain.get_latest_block().index + 1
+                                if blk.index == expected and blk.previous_hash == blockchain.get_latest_block().hash:
                                     blockchain.chain.append(blk)
                                     print(f"[INFO] added block #{blk.index} from peer")
                                 else:
-                                    print("[WARN] out-of-order block ignored")
+                                    # attempt fork reorg
+                                    if reorganize_chain(blk):
+                                        print(f"[INFO] reorganized chain; added block #{blk.index}")
+                                    else:
+                                        print("[WARN] fork with unknown ancestor; waiting for headers")
                         else:
                             print("[WARN] invalid PoW in block")
                     except Exception as e:
                         print("[ERR]", e)
+                    remote_len = msg.get("length", blk.index + 1)
+                    if remote_len > len(blockchain.chain):
+                        get_hdr = {
+                            "type": "GET_HEADERS",
+                            "src":  node_id,
+                            "dst":  msg["src"],
+                            "ts":   time.time(),
+                            "payload": { "from_index": max(0, len(blockchain.chain)-10) }
+                        }
+                        self.send(json.dumps(get_hdr).encode())
+
+                elif mtype == "GET_HEADERS":
+                    # Peer wants headers starting from a given index
+                    if msg["dst"] in ("*", node_id):
+                        loc_index = msg["payload"]["from_index"]
+                        with blockchain.lock:
+                            headers = [
+                                block_to_header(b)
+                                for b in blockchain.chain
+                                if b.index >= loc_index
+                            ]
+                        reply = {
+                            "type": "HEADERS",
+                            "src":  node_id,
+                            "dst":  msg["src"],
+                            "ts":   time.time(),
+                            "headers": headers
+                        }
+                        self.send(json.dumps(reply).encode())
+
+                elif mtype == "HEADERS":
+                    if msg["dst"] in ("*", node_id):
+                        last = msg["headers"][-1]
+                        remote_tip = last["index"]
+                        if remote_tip > blockchain.get_latest_block().index:
+                            # ask for full blocks we are missing
+                            need_from = blockchain.get_latest_block().index + 1
+                            req = {
+                                "type": "GET_BLOCKS",
+                                "src":  node_id,
+                                "dst":  msg["src"],
+                                "ts":   time.time(),
+                                "from_index": need_from
+                            }
+                            self.send(json.dumps(req).encode())
+
+                elif mtype == "GET_BLOCKS":
+                    if msg["dst"] in ("*", node_id):
+                        start = msg["from_index"]
+                        with blockchain.lock:
+                            blks = [
+                                block_to_dict(b)
+                                for b in blockchain.chain
+                                if b.index >= start
+                            ]
+                        reply = {
+                            "type": "BLOCKS",
+                            "src":  node_id,
+                            "dst":  msg["src"],
+                            "ts":   time.time(),
+                            "blocks": blks
+                        }
+                        self.send(json.dumps(reply).encode())
+
+                elif mtype == "BLOCKS":
+                    if msg["dst"] in ("*", node_id):
+                        try:
+                            new_blks = [dict_to_block(bd) for bd in msg["blocks"]]
+                            with blockchain.lock:
+                                if new_blks[0].index == blockchain.get_latest_block().index + 1:
+                                    blockchain.chain.extend(new_blks)
+                                    print(f"[INFO] extended chain by {len(new_blks)} blocks")
+                        except Exception as e:
+                            print("[ERR] importing blocks:", e)
+                elif mtype == "REQ_CHAIN":
+                    if msg["dst"] in ("*", node_id):
+                        send_full_chain(self, msg["src"], node_id)
+
+                elif mtype == "CHAIN":
+                    if msg["dst"] in ("*", node_id):
+                        try:
+                            new_chain = Blockchain.deserialize_chain(msg["chain"])
+                            if blockchain.replace_chain(new_chain):
+                                print("[INFO] Replaced local chain with longer one")
+                        except Exception as e:
+                            print("[ERR] failed to import chain:", e)
                 else:
                     print("[RECV]", msg)
 
@@ -147,6 +286,21 @@ def dict_to_block(d: dict) -> Block:
         raise ValueError("Hash mismatch in received block")
     blk.hash = d["hash"]
     return blk
+
+def block_to_header(block: Block) -> dict:
+    """Lightweight dict for HEADERS messages."""
+    return block.header()
+
+def send_full_chain(net_if: 'NetworkInterface', dst_id: str, node_id: str):
+    """Send entire chain to a peer that asked for it."""
+    msg = {
+        "type":  "CHAIN",
+        "src":   node_id,
+        "dst":   dst_id,
+        "ts":    time.time(),
+        "chain": blockchain.serialize_chain()
+    }
+    net_if.send(json.dumps(msg).encode())
 
 def parse_message(message):
     """
@@ -194,9 +348,34 @@ def send_user_blocks(net_if: 'NetworkInterface', node_id: str):
     """Prompt user for votes, mine a block, broadcast it."""
     while True:
         try:
-            rawA = input("> Votes for party A (or 'show'): ").strip()
+            rawA = input("> Votes for party A "
+                         "(commands: show | broadcast): ").strip()
             if rawA.lower() == "show":
                 show_chain()
+                continue
+            if rawA.lower() == "broadcast":
+                # send all queued blocks
+                while pending_broadcast:
+                    blk = pending_broadcast.pop(0)
+                    head_msg = {
+                        "type": "HEADERS",
+                        "src":  node_id,
+                        "dst":  "*",
+                        "ts":   time.time(),
+                        "headers": [block_to_header(blk)]
+                    }
+                    net_if.send(json.dumps(head_msg).encode())
+
+                    msg = {
+                        "type":  "BLOCK_MINED",
+                        "src":   node_id,
+                        "dst":   "*",
+                        "ts":    time.time(),
+                        "length": len(blockchain.chain),
+                        "block": block_to_dict(blk)
+                    }
+                    net_if.send(json.dumps(msg).encode())
+                    print(f"[INFO] broadcast stored block #{blk.index}")
                 continue
             votesA = int(rawA)
 
@@ -227,11 +406,28 @@ def send_user_blocks(net_if: 'NetworkInterface', node_id: str):
             print("[WARN] mining failed")
             continue
 
+        # Ask user if they want to broadcast right now
+        choice = input("Broadcast this block now? (y/n): ").strip().lower()
+        if choice != "y":
+            pending_broadcast.append(new_blk)
+            print(f"[INFO] queued block #{new_blk.index} for later broadcast")
+            continue
+
+        head_msg = {
+            "type":  "HEADERS",
+            "src":   node_id,
+            "dst":   "*",
+            "ts":    time.time(),
+            "headers": [block_to_header(new_blk)]
+        }
+        net_if.send(json.dumps(head_msg).encode())
+
         msg = {
-            "type": "BLOCK_MINED",
-            "src":  node_id,
-            "dst":  "*",
-            "ts":   time.time(),
+            "type":  "BLOCK_MINED",
+            "src":   node_id,
+            "dst":   "*",
+            "ts":    time.time(),
+            "length": len(blockchain.chain),
             "block": block_to_dict(new_blk)
         }
         net_if.send(json.dumps(msg).encode())
