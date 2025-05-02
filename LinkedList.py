@@ -3,11 +3,6 @@
 # It includes basic functionalities like adding blocks, mining, and validating the chain.
 # Author: Roni Herschmann
 
-# Blockchain Implementation in Python
-# This is the linked list implementation of a simple blockchain
-# It includes basic functionalities like adding blocks, mining, and validating the chain.
-# Author: Roni Herschmann
-
 import hashlib
 import time
 import json
