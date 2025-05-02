@@ -1,7 +1,5 @@
 # Blockchain Linked List Design
 # Author: Roni Herschmann
-# Blockchain Linked List Design
-# Author: Roni Herschmann
 ## Overview
 This document outlines the enhanced linked list implementation for our blockchain-based voting system. The blockchain is designed as a sequential chain of blocks, where each block contains voting transactions, network information, and cryptographic links to maintain the chain's integrity. This implementation focuses on robustness, security, and concurrency management for distributed deployment.
 
