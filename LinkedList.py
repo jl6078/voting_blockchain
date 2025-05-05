@@ -331,17 +331,13 @@ class Blockchain:
             Dict: Dictionary with candidate names as keys and vote counts as values
         """
         tally = {}
-        
         with self.lock:
             for block in self.chain:
                 for transaction in block.transactions:
-                    if 'vote' in transaction:
-                        candidate = transaction['vote']
-                        if candidate in tally:
-                            tally[candidate] += 1
-                        else:
-                            tally[candidate] = 1
-        
+                    votes = transaction.get('vote', {})
+                    if isinstance(votes, dict):
+                        for cand, n in votes.items():
+                            tally[cand] = tally.get(cand, 0) + int(n)
         logger.info(f"Current vote tally: {tally}")            
         return tally
         

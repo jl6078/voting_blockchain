@@ -1,11 +1,113 @@
-import sys, socket, time, json, threading
+import sys, socket, time, json, threading, webbrowser
 from LinkedList import Blockchain, Block
+
+# Flask imports
+from flask import Flask, request, redirect, url_for, render_template_string
 
 # Local blockchain instance and live peer list
 blockchain = Blockchain(difficulty=1)
 peer_ids: list[str] = []
 # Blocks mined locally but not yet broadcast
 pending_broadcast: list[Block] = []
+
+# ────────────────────────────── NODE ID ──────────────────────────────
+NODE_ID = None     # will be set in __main__
+
+# ────────────────────────────── Flask app ──────────────────────────────
+app = Flask(__name__)
+
+PAGE = """
+<!doctype html>
+<title>Node {{ node }}</title>
+<meta http-equiv="refresh" content="5">
+<h2>Node {{ node }} — chain length {{ length }}</h2>
+
+<form method="post" action="{{ url_for('submit_vote') }}">
+  <label>Votes for A</label><input name="a" type="number" required>
+  <label>Votes for B</label><input name="b" type="number" required>
+  <label>Broadcast now?</label>
+  <select name="broadcast">
+     <option value="y" selected>Yes</option>
+     <option value="n">No</option>
+  </select>
+  <button type="submit">Submit</button>
+</form>
+
+<p>
+  <a href="{{ url_for('view_chain') }}">View chain</a> |
+  <a href="{{ url_for('view_tally') }}">Vote tally</a> |
+  <a href="{{ url_for('do_broadcast') }}">Broadcast queued blocks</a>
+</p>
+"""
+# -------------------------------------------------------------------------
+
+# ────────────────────────── Helper to broadcast a mined block ──────────────────────────
+def _broadcast_block(blk: Block):
+    head_msg = {
+        "type": "HEADERS",
+        "src":  NODE_ID,
+        "dst":  "*",
+        "ts":   time.time(),
+        "headers": [block_to_header(blk)]
+    }
+    net_interface.send(json.dumps(head_msg).encode())
+
+    msg = {
+        "type":  "BLOCK_MINED",
+        "src":   NODE_ID,
+        "dst":   "*",
+        "ts":    time.time(),
+        "length": len(blockchain.chain),
+        "block": block_to_dict(blk)
+    }
+    net_interface.send(json.dumps(msg).encode())
+    print(f"[INFO] broadcast block #{blk.index}")
+
+# ────────────────────────── Flask route functions ──────────────────────────
+@app.route("/")
+def index():
+    return render_template_string(PAGE,
+                                  node=NODE_ID,
+                                  length=len(blockchain.chain))
+
+@app.route("/vote", methods=["POST"])
+def submit_vote():
+    votesA = int(request.form["a"])
+    votesB = int(request.form["b"])
+    broadcast_now = request.form["broadcast"] == "y"
+
+    tx = {"vote": {"A": votesA, "B": votesB}, "timestamp": time.time()}
+    try:
+        blockchain.add_transaction(tx)
+    except ValueError as e:
+        return f"Transaction rejected: {e}", 400
+
+    blk = blockchain.add_block(nodes=peer_ids)
+    if blk is None:
+        return "Mining failed", 500
+
+    if broadcast_now:
+        _broadcast_block(blk)
+    else:
+        pending_broadcast.append(blk)
+
+    return redirect(url_for('index'))
+
+@app.route("/broadcast")
+def do_broadcast():
+    while pending_broadcast:
+        _broadcast_block(pending_broadcast.pop(0))
+    return redirect(url_for('index'))
+
+@app.route("/chain")
+def view_chain():
+    return "<pre>" + "\n".join(
+        f"#{b.index} {b.hash[:12]} txs={len(b.transactions)}"
+        for b in blockchain.chain) + "</pre>"
+
+@app.route("/tally")
+def view_tally():
+    return "<pre>" + json.dumps(blockchain.get_votes_tally(), indent=2) + "</pre>"
 
 # ────────────────────────────── Chain reorg helper ──────────────────────────────
 def reorganize_chain(new_blk: Block):
@@ -168,7 +270,7 @@ class NetworkInterface():
                     if remote_len > len(blockchain.chain):
                         get_hdr = {
                             "type": "GET_HEADERS",
-                            "src":  node_id,
+                            "src":  NODE_ID,
                             "dst":  msg["src"],
                             "ts":   time.time(),
                             "payload": { "from_index": max(0, len(blockchain.chain)-10) }
@@ -177,7 +279,7 @@ class NetworkInterface():
 
                 elif mtype == "GET_HEADERS":
                     # Peer wants headers starting from a given index
-                    if msg["dst"] in ("*", node_id):
+                    if msg["dst"] in ("*", NODE_ID):
                         loc_index = msg["payload"]["from_index"]
                         with blockchain.lock:
                             headers = [
@@ -187,7 +289,7 @@ class NetworkInterface():
                             ]
                         reply = {
                             "type": "HEADERS",
-                            "src":  node_id,
+                            "src":  NODE_ID,
                             "dst":  msg["src"],
                             "ts":   time.time(),
                             "headers": headers
@@ -195,7 +297,7 @@ class NetworkInterface():
                         self.send(json.dumps(reply).encode())
 
                 elif mtype == "HEADERS":
-                    if msg["dst"] in ("*", node_id):
+                    if msg["dst"] in ("*", NODE_ID):
                         last = msg["headers"][-1]
                         remote_tip = last["index"]
                         if remote_tip > blockchain.get_latest_block().index:
@@ -203,7 +305,7 @@ class NetworkInterface():
                             need_from = blockchain.get_latest_block().index + 1
                             req = {
                                 "type": "GET_BLOCKS",
-                                "src":  node_id,
+                                "src":  NODE_ID,
                                 "dst":  msg["src"],
                                 "ts":   time.time(),
                                 "from_index": need_from
@@ -211,7 +313,7 @@ class NetworkInterface():
                             self.send(json.dumps(req).encode())
 
                 elif mtype == "GET_BLOCKS":
-                    if msg["dst"] in ("*", node_id):
+                    if msg["dst"] in ("*", NODE_ID):
                         start = msg["from_index"]
                         with blockchain.lock:
                             blks = [
@@ -221,7 +323,7 @@ class NetworkInterface():
                             ]
                         reply = {
                             "type": "BLOCKS",
-                            "src":  node_id,
+                            "src":  NODE_ID,
                             "dst":  msg["src"],
                             "ts":   time.time(),
                             "blocks": blks
@@ -229,7 +331,7 @@ class NetworkInterface():
                         self.send(json.dumps(reply).encode())
 
                 elif mtype == "BLOCKS":
-                    if msg["dst"] in ("*", node_id):
+                    if msg["dst"] in ("*", NODE_ID):
                         try:
                             new_blks = [dict_to_block(bd) for bd in msg["blocks"]]
                             with blockchain.lock:
@@ -239,11 +341,11 @@ class NetworkInterface():
                         except Exception as e:
                             print("[ERR] importing blocks:", e)
                 elif mtype == "REQ_CHAIN":
-                    if msg["dst"] in ("*", node_id):
-                        send_full_chain(self, msg["src"], node_id)
+                    if msg["dst"] in ("*", NODE_ID):
+                        send_full_chain(self, msg["src"], NODE_ID)
 
                 elif mtype == "CHAIN":
-                    if msg["dst"] in ("*", node_id):
+                    if msg["dst"] in ("*", NODE_ID):
                         try:
                             new_chain = Blockchain.deserialize_chain(msg["chain"])
                             if blockchain.replace_chain(new_chain):
@@ -434,72 +536,21 @@ def send_user_blocks(net_if: 'NetworkInterface', node_id: str):
         print(f"[INFO] broadcast block #{new_blk.index}")
 
     
-
-
 if __name__ == '__main__':
-    network_ip   = sys.argv[1]          # tracker IP
-    network_port = int(sys.argv[2])     # tracker port
-    node_id      = sys.argv[3]          # unique ID for this peer
+    if len(sys.argv) < 4:
+        print("Usage: python3 decentralized_node.py <tracker_ip> <tracker_port> <node_id> [flask_port]")
+        sys.exit(1)
 
-    net_interface = NetworkInterface(network_port, network_ip, node_id)
+    tracker_ip   = sys.argv[1]
+    tracker_port = int(sys.argv[2])
+    NODE_ID      = sys.argv[3]
+    flask_port   = int(sys.argv[4]) if len(sys.argv) > 4 else 7000
 
-    listener_thread = threading.Thread(target=net_interface.listen_for_messages,
-                                    daemon=True)
-    listener_thread.start()
+    net_interface = NetworkInterface(tracker_port, tracker_ip, NODE_ID)
+    threading.Thread(target=net_interface.listen_for_messages, daemon=True).start()
 
-    send_user_blocks(net_interface, node_id)
+    # optional: open browser automatically
+    threading.Timer(1.0, lambda:
+        webbrowser.open(f"http://127.0.0.1:{flask_port}/")).start()
 
-
-
-
-
-
-
-
-
-
-    # """Initialize dv table with the costs of direct neighbors"""
-    # for pair in neighbors_pairs:
-    #     neighbor_id, cost = pair.split(":") 
-    #     if neighbor_id not in neighbors:
-    #         neighbors.append(neighbor_id)
-    #         direct_link_costs[neighbor_id] = int(cost) 
-
-    #     dv_table.setdefault(neighbor_id, []).append((neighbor_id, int(cost)))
-
-    # """Log initial distance vector"""
-    # log_file = open(f"log_{node_id}.txt", "w") 
-    # write_log(node_id, dv_table)
-    
-    """Extract DV from DV table"""
-    distance_vector = get_distance_vector(dv_table) 
-
-    """Send the initial distance vector to neighbors"""
-    message = dv_to_message(node_id, distance_vector)
-    net_interface.send(message)
-
-    while True:
-        message = net_interface.recv(4096) 
-
-        messages = message.decode().strip().split("\n")  
-
-        all_node_dvs = {}  
-
-        for msg in messages:
-            if msg.strip():  
-                recv_node_id, recv_dv = parse_message(msg)
-                all_node_dvs[recv_node_id] = recv_dv
-
-        for recv_node_id, recv_dv in all_node_dvs.items():
-            new_dv_table, new_dv = update_dv(node_id, recv_node_id, dv_table, recv_dv, direct_link_costs)
-
-            dv_table = new_dv_table
-            print("DV table updated")
-
-            if new_dv != distance_vector:
-                print(f"Updated distance vector: {new_dv}")
-                distance_vector = new_dv
-                message = dv_to_message(node_id, new_dv)
-                net_interface.send(message)
-                write_log(node_id, dv_table)  
-
+    app.run(host="0.0.0.0", port=flask_port, debug=False)
