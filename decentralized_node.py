@@ -16,28 +16,126 @@ NODE_ID = None     # will be set in __main__
 # ────────────────────────────── Flask app ──────────────────────────────
 app = Flask(__name__)
 
+# -------------------------------------------------------------------------
 PAGE = """
 <!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
 <title>Node {{ node }}</title>
-<meta http-equiv="refresh" content="5">
-<h2>Node {{ node }} — chain length {{ length }}</h2>
+<style>
+  body            { font-family: system-ui, sans-serif; background:#f5f7fa;
+                    margin:0; padding:2rem; color:#333;}
+  h1,h2           { margin-top:0; color:#2a2a2a;}
+  .card           { background:#fff; border-radius:8px; padding:1.5rem;
+                    box-shadow:0 2px 6px rgba(0,0,0,.08); max-width:620px;}
+  label           { display:block; margin:.5rem 0 .25rem; font-weight:500;}
+  input,select    { width:100%; padding:.5rem .6rem; font-size:1rem;
+                    border:1px solid #ccc; border-radius:4px;}
+  button          { margin-top:1rem; padding:.6rem 1.2rem; font-size:1rem;
+                    background:#0077ff; color:#fff; border:none;
+                    border-radius:4px; cursor:pointer;}
+  button:hover    { background:#005fe0;}
+  nav a           { color:#0077ff; text-decoration:none; margin-right:1rem;}
+  nav a:hover     { text-decoration:underline;}
+  .meta           { font-size:.9rem; color:#555; margin-bottom:1rem;}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h2>Node {{ node }}</h2>
+    <p class="meta">Blockchain length: <strong>{{ length }}</strong></p>
 
-<form method="post" action="{{ url_for('submit_vote') }}">
-  <label>Votes for A</label><input name="a" type="number" required>
-  <label>Votes for B</label><input name="b" type="number" required>
-  <label>Broadcast now?</label>
-  <select name="broadcast">
-     <option value="y" selected>Yes</option>
-     <option value="n">No</option>
-  </select>
-  <button type="submit">Submit</button>
-</form>
+    <form method="post" action="{{ url_for('submit_vote') }}">
+      <label for="a">Votes for A</label>
+      <input id="a" name="a" type="number" min="0" required>
 
-<p>
-  <a href="{{ url_for('view_chain') }}">View chain</a> |
-  <a href="{{ url_for('view_tally') }}">Vote tally</a> |
-  <a href="{{ url_for('do_broadcast') }}">Broadcast queued blocks</a>
-</p>
+      <label for="b">Votes for B</label>
+      <input id="b" name="b" type="number" min="0" required>
+
+      <label for="broadcast">Broadcast now?</label>
+      <select id="broadcast" name="broadcast">
+         <option value="y" selected>Yes</option>
+         <option value="n">No (queue)</option>
+      </select>
+
+      <button type="submit">Submit Vote</button>
+    </form>
+
+    <nav style="margin-top:1.5rem;">
+      <a href="{{ url_for('view_chain') }}">🔗 View chain</a>
+      <a href="{{ url_for('view_tally') }}">🗳️ Vote tally</a>
+      <a href="{{ url_for('do_broadcast') }}">📡 Broadcast queued blocks</a>
+    </nav>
+  </div>
+</body>
+</html>
+"""
+
+# -------------------------------------------------------------------------
+# Additional template strings for chain and tally pages
+CHAIN_PAGE = """
+<!doctype html>
+<html><head><meta charset="utf-8">
+<title>Chain – Node {{ node }}</title>
+<style>
+ body{font-family:system-ui,sans-serif;background:#f5f7fa;margin:0;padding:2rem;color:#333;}
+ table{border-collapse:collapse;width:100%;max-width:900px;background:#fff;
+       box-shadow:0 2px 6px rgba(0,0,0,.08);border-radius:8px;overflow:hidden;}
+ th,td{padding:.75rem 1rem;text-align:left;border-bottom:1px solid #eee;font-size:.9rem;}
+ th{background:#0077ff;color:#fff;font-weight:600;border:none;}
+ tr:last-child td{border-bottom:none;}
+ code{font-family:monospace;}
+ a{color:#0077ff;text-decoration:none;margin-top:1rem;display:inline-block;}
+ a:hover{text-decoration:underline;}
+</style></head><body>
+<h2>Blockchain – Node {{ node }}</h2>
+<table>
+<thead><tr><th>#</th><th>Hash&nbsp;(first&nbsp;12)</th><th>Txs</th><th>Time</th></tr></thead>
+<tbody>
+{% for b in chain %}
+<tr>
+  <td>{{ b.index }}</td>
+  <td><code>{{ b.hash[:12] }}</code></td>
+  <td>{{ b.txs }}</td>
+  <td>{{ b.time }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+<a href="{{ url_for('index') }}">← back</a>
+</body></html>
+"""
+
+TALLY_PAGE = """
+<!doctype html>
+<html><head><meta charset="utf-8">
+<title>Tally – Node {{ node }}</title>
+<style>
+ body{font-family:system-ui,sans-serif;background:#f5f7fa;margin:0;padding:2rem;color:#333;}
+ .card{background:#fff;max-width:400px;padding:1.5rem;border-radius:8px;
+       box-shadow:0 2px 6px rgba(0,0,0,.08);}
+ h2{margin-top:0;}
+ table{width:100%;border-collapse:collapse;margin-top:1rem;}
+ th,td{padding:.6rem .8rem;text-align:left;border-bottom:1px solid #eee;font-size:.9rem;}
+ th{background:#0077ff;color:#fff;font-weight:600;border:none;}
+ tr:last-child td{border-bottom:none;}
+ a{color:#0077ff;text-decoration:none;margin-top:1.2rem;display:inline-block;}
+ a:hover{text-decoration:underline;}
+</style></head><body>
+<div class="card">
+ <h2>Vote tally – Node {{ node }}</h2>
+ <table>
+   <thead><tr><th>Candidate</th><th>Votes</th></tr></thead>
+   <tbody>
+     {% for cand,n in tally.items() %}
+       <tr><td>{{ cand }}</td><td>{{ n }}</td></tr>
+     {% endfor %}
+   </tbody>
+ </table>
+ <a href="{{ url_for('index') }}">← back</a>
+</div>
+</body></html>
 """
 # -------------------------------------------------------------------------
 
@@ -101,13 +199,24 @@ def do_broadcast():
 
 @app.route("/chain")
 def view_chain():
-    return "<pre>" + "\n".join(
-        f"#{b.index} {b.hash[:12]} txs={len(b.transactions)}"
-        for b in blockchain.chain) + "</pre>"
+    chain_rows = [
+        {
+            "index": b.index,
+            "hash":  b.hash,
+            "txs":   len(b.transactions),
+            "time":  time.strftime('%H:%M:%S', time.localtime(b.timestamp))
+        }
+        for b in blockchain.chain
+    ]
+    return render_template_string(CHAIN_PAGE,
+                                  node=NODE_ID,
+                                  chain=chain_rows)
 
 @app.route("/tally")
 def view_tally():
-    return "<pre>" + json.dumps(blockchain.get_votes_tally(), indent=2) + "</pre>"
+    return render_template_string(TALLY_PAGE,
+                                  node=NODE_ID,
+                                  tally=blockchain.get_votes_tally())
 
 # ────────────────────────────── Chain reorg helper ──────────────────────────────
 def reorganize_chain(new_blk: Block):
