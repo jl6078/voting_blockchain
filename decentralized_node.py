@@ -155,7 +155,7 @@ def _broadcast_block(blk: Block):
         "src":   NODE_ID,
         "dst":   "*",
         "ts":    time.time(),
-        "length": len(blockchain.chain),
+        "length": blk.index + 1,
         "block": block_to_dict(blk)
     }
     net_interface.send(json.dumps(msg).encode())
@@ -193,8 +193,12 @@ def submit_vote():
 
 @app.route("/broadcast")
 def do_broadcast():
-    while pending_broadcast:
-        _broadcast_block(pending_broadcast.pop(0))
+    """
+    Broadcast every queued block in the order it was mined.
+    """
+    for blk in list(pending_broadcast):   # iterate over a snapshot
+        _broadcast_block(blk)
+    pending_broadcast.clear()
     return redirect(url_for('index'))
 
 @app.route("/chain")
@@ -243,7 +247,7 @@ def reorganize_chain(new_blk: Block):
         # 3️⃣ insert the incoming block
         blockchain.chain.append(new_blk)
 
-        # 4️⃣ re-mine and append each saved local block so it now links to the updated tip
+        # 4️⃣ re‑mine and append orphaned blocks so they follow the new tip
         reattached = 0
         for old_blk in local_tail:
             # assign new sequential index to avoid duplicates
@@ -256,11 +260,14 @@ def reorganize_chain(new_blk: Block):
                 blockchain.chain.append(old_blk)
                 reattached += 1
             except TimeoutError:
-                print(f"[WARN] re‑mining block (old idx {old_blk.index}) timed out; queued")
+                print(f"[WARN] re‑mining block #{old_blk.index} timed out; queued")
                 pending_broadcast.append(old_blk)
 
-        print(f"[INFO] Reorg complete: attached broadcast block and re‑added {reattached} local blocks")
-        print("[DEBUG] Chain FINAL after re-attach:")
+        if reattached:
+            print(f"[INFO] Re‑attached {reattached} orphaned blocks on new tip")
+
+        print("[INFO] Reorg complete: chain now matches broadcasting peer plus re‑attached blocks")
+        print("[DEBUG] Chain FINAL after re‑attach:")
         show_chain()
         return True
 
@@ -355,10 +362,24 @@ class NetworkInterface():
                     global peer_ids
                     peer_ids = msg["payload"]["nodes"]
                     print(f"[INFO] peers → {peer_ids}")
+                    # --- Auto‑sync for fresh nodes -------------------
+                    # If we have only the genesis block, request headers
+                    if len(blockchain.chain) == 1 and peer_ids:
+                        target_peer = peer_ids[0]
+                        req = {
+                            "type": "GET_HEADERS",
+                            "src":  NODE_ID,
+                            "dst":  target_peer,
+                            "ts":   time.time(),
+                            "payload": { "from_index": 0 }
+                        }
+                        self.send(json.dumps(req).encode())
+                        print(f"[INFO] Requested full headers from {target_peer} for initial sync")
 
                 elif mtype == "BLOCK_MINED":
                     try:
                         blk = dict_to_block(msg["block"])
+                        remote_len = msg.get("length", blk.index + 1)  # sender’s chain length
                         if blk.is_valid(blockchain.difficulty):
                             with blockchain.lock:
                                 expected = blockchain.get_latest_block().index + 1
@@ -366,25 +387,30 @@ class NetworkInterface():
                                     blockchain.chain.append(blk)
                                     print(f"[INFO] added block #{blk.index} from peer")
                                 else:
-                                    # attempt fork reorg
-                                    if reorganize_chain(blk):
-                                        print(f"[INFO] reorganized chain; added block #{blk.index}")
+                                    if remote_len > len(blockchain.chain):
+                                        # Attempt reorg only if their chain is longer
+                                        if reorganize_chain(blk):
+                                            print(f"[INFO] reorganized chain; added block #{blk.index}")
+                                        else:
+                                            print("[WARN] fork with unknown ancestor; waiting for headers")
                                     else:
-                                        print("[WARN] fork with unknown ancestor; waiting for headers")
+                                        print(f"[INFO] ignored shorter chain from {msg['src']} "
+                                              f"(len {remote_len} vs {len(blockchain.chain)})")
+                                        # Send polite rejection
+                                        rej = {
+                                            "type":   "REJECT_BLOCK",
+                                            "src":    NODE_ID,
+                                            "dst":    msg["src"],
+                                            "ts":     time.time(),
+                                            "reason": "shorter_chain",
+                                            "your_length": remote_len,
+                                            "my_length":   len(blockchain.chain)
+                                        }
+                                        self.send(json.dumps(rej).encode())
                         else:
                             print("[WARN] invalid PoW in block")
                     except Exception as e:
                         print("[ERR]", e)
-                    remote_len = msg.get("length", blk.index + 1)
-                    if remote_len > len(blockchain.chain):
-                        get_hdr = {
-                            "type": "GET_HEADERS",
-                            "src":  NODE_ID,
-                            "dst":  msg["src"],
-                            "ts":   time.time(),
-                            "payload": { "from_index": max(0, len(blockchain.chain)-10) }
-                        }
-                        self.send(json.dumps(get_hdr).encode())
 
                 elif mtype == "GET_HEADERS":
                     # Peer wants headers starting from a given index
@@ -461,6 +487,9 @@ class NetworkInterface():
                                 print("[INFO] Replaced local chain with longer one")
                         except Exception as e:
                             print("[ERR] failed to import chain:", e)
+                elif mtype == "REJECT_BLOCK":
+                    if msg["dst"] in ("*", NODE_ID):
+                        print(f"[INFO] block rejected by {msg['src']} – reason: {msg.get('reason')}")
                 else:
                     print("[RECV]", msg)
 

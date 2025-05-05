@@ -58,3 +58,32 @@ Transactions:
 - Node A broadcasts (B should remove its unbroadcasted block, adopt the longer chain, and place it in the broadcasting queue)
 - Node B broadcasts the transactions it removed and queued
 
+
+Test Case 5: Ensure that longest chain rejects shorter chain broadcast
+Nodes:
+- Node A (will be longest chain)
+- Node B (shorter chain broadcasting)
+
+Transactions:
+- Node A votes 10, 10
+- Node A votes 21, 23 and doesn't broadcast
+- Node A votes 31, 2 and doesn't broadcast
+- Node B votes 32, 10, and broadcasts
+- Node A rejects block from Node B (shorter blockchain) and retains its current chain
+
+Test Case 6: Ensure that new node joining network updates to the longest chain is requested
+Nodes:
+- Node A
+- Node B
+- Node C (will join after 2 transactions)
+
+- Node A votes 10, 20
+- Node B votes 21, 33
+- Node C joins (receives votes 31, 53)
+
+
+
+
+
+
+All above test cases output blockchains as expected.
